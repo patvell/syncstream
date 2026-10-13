@@ -99,12 +99,14 @@ export default function RoomPageClient() {
     title: selectedTitle || undefined,
   });
 
-  // Copy room link
+  // Copy room link -- share a CLEAN url (no tmdbId query params) so the link
+  // is short. Peers pick up content + position via realtime sync_state.
   const copyRoomLink = useCallback(() => {
-    navigator.clipboard.writeText(window.location.href);
+    const cleanUrl = `${window.location.origin}/room/${roomId}`;
+    navigator.clipboard.writeText(cleanUrl);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
-  }, []);
+  }, [roomId]);
 
   // Handle incoming lobby updates (real-time broadcast from other devices).
   // setState below is driven by an async realtime subscription event, which
@@ -390,21 +392,21 @@ export default function RoomPageClient() {
             </div>
           ) : null}
 
-          {/* Tap to Join Sync -- full screen overlay */}
-          <div className="fixed inset-0 z-50 bg-black/90 flex items-center justify-center">
-            <div className="text-center space-y-6 animate-fade-in">
-              <div className="w-20 h-20 rounded-full bg-emerald-500/20 flex items-center justify-center mx-auto">
-                <Play className="w-10 h-10 text-emerald-500 fill-emerald-500 ml-1" />
-              </div>
-              <div>
-                <h2 className="text-2xl font-bold text-zinc-100 mb-2">
+          {/* Join Sync prompt -- only after a title is selected.
+              Inline (not full-screen) so browsing stays usable. */}
+          {selectedTmdbId && (
+            <div className="bg-zinc-900 border border-emerald-500/30 rounded-2xl p-6 text-center shadow-lg shadow-emerald-500/5">
+              <div className="flex items-center justify-center gap-2 mb-2">
+                <Play className="w-5 h-5 text-emerald-500 fill-emerald-500" />
+                <h2 className="text-lg font-semibold text-zinc-100">
                   Ready to Watch Together
                 </h2>
-                <p className="text-sm text-zinc-400 max-w-xs mx-auto">
-                  Tap below to start synced playback. This satisfies browser
-                  autoplay requirements.
-                </p>
               </div>
+              <p className="text-sm text-zinc-400 mb-4">
+                {selectedTitle
+                  ? `"${selectedTitle}" is queued. Tap below to start synced playback.`
+                  : "Tap below to start synced playback."}
+              </p>
               <button
                 onClick={handleJoinSync}
                 className="px-10 py-4 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 text-lg font-bold rounded-2xl transition-all hover:scale-105 active:scale-95 focusable shadow-lg shadow-emerald-500/25"
@@ -413,7 +415,7 @@ export default function RoomPageClient() {
                 Tap to Join Sync
               </button>
             </div>
-          </div>
+          )}
         </div>
       )}
 
@@ -429,6 +431,11 @@ export default function RoomPageClient() {
               autoplay={true}
               muted={false}
               onTimeUpdate={handleTimeUpdate}
+              controllerRef={(controller) => {
+                if (controller) {
+                  playerRef.current = controller;
+                }
+              }}
             />
           </div>
 

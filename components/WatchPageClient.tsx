@@ -62,10 +62,12 @@ export default function WatchPageClient({ media }: WatchPageClientProps) {
 
   const createRoom = useCallback(() => {
     const roomId = generateRoomCode();
-    // Keep the link minimal: just the room code. Content + playback state is
-    // synced via realtime lobby/action broadcasts once peers join.
-    router.push(`/room/${roomId}`);
-  }, [router]);
+    // Creator's own URL carries the initial content; the room link shared to
+    // friends is clean (peers pick up content + state via realtime sync).
+    router.push(
+      `/room/${roomId}?tmdbId=${tmdbId}&type=${mediaType}&season=${season}&episode=${episode}`
+    );
+  }, [router, tmdbId, mediaType, season, episode]);
 
   const joinRoom = useCallback(() => {
     if (roomInput.trim()) {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useEffect } from "react";
+import { useCallback, useRef, useEffect, type RefCallback } from "react";
 import type {
   FrameXTVTimeUpdate,
   FrameXTVAction,
@@ -16,6 +16,8 @@ interface FrameXTVPlayerProps {
   onTimeUpdate?: (data: FrameXTVTimeUpdate) => void;
   /** Sandbox the iframe to block popups/redirects. Default: true */
   sandbox?: boolean;
+  /** Optional callback ref that receives the player controller. */
+  controllerRef?: RefCallback<PlayerController | null>;
 }
 
 export interface PlayerController {
@@ -36,35 +38,38 @@ export default function FrameXTVPlayer({
   startTime,
   onTimeUpdate,
   sandbox = true,
+  controllerRef,
 }: FrameXTVPlayerProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  const controllerRef = useRef<PlayerController>({
-    play: () => {},
-    pause: () => {},
-    seek: () => {},
-    seekBy: () => {},
-    setVolume: () => {},
-    mute: () => {},
-  });
 
   const postMessage = useCallback((payload: FrameXTVAction) => {
-    if (iframeRef.current?.contentWindow) {
-      iframeRef.current.contentWindow.postMessage(payload, "*");
-    }
+    iframeRef.current?.contentWindow?.postMessage(payload, "*");
   }, []);
 
-  // Build controller
-  useEffect(() => {
-    controllerRef.current = {
-      play: () => postMessage({ action: "play" }),
-      pause: () => postMessage({ action: "pause" }),
-      seek: (time: number) => postMessage({ action: "seek", time }),
-      seekBy: (seconds: number) => postMessage({ action: "seekBy", seconds }),
-      setVolume: (volume: number) =>
-        postMessage({ action: "setVolume", volume }),
-      mute: () => postMessage({ action: "mute" }),
-    };
-  }, [postMessage]);
+  // Expose a stable controller to the parent via a callback ref. Creating the
+  // controller once here (postMessage is stable) keeps it consistent.
+  const controller = useRef<PlayerController>({
+    play: () => postMessage({ action: "play" }),
+    pause: () => postMessage({ action: "pause" }),
+    seek: (time: number) => postMessage({ action: "seek", time }),
+    seekBy: (seconds: number) => postMessage({ action: "seekBy", seconds }),
+    setVolume: (volume: number) =>
+      postMessage({ action: "setVolume", volume }),
+    mute: () => postMessage({ action: "mute" }),
+  }).current;
+
+  // set controllerRef (a callback ref) when the iframe mounts
+  const setIframeRef = useCallback(
+    (node: HTMLIFrameElement | null) => {
+      iframeRef.current = node;
+      if (node) {
+        controllerRef?.(controller);
+      } else {
+        controllerRef?.(null);
+      }
+    },
+    [controllerRef, controller]
+  );
 
   // Listen for timeupdate telemetry
   useEffect(() => {
@@ -101,7 +106,7 @@ export default function FrameXTVPlayer({
   return (
     <div className="relative w-full aspect-video rounded-xl overflow-hidden bg-black border border-zinc-800 shadow-2xl">
       <iframe
-        ref={iframeRef}
+        ref={setIframeRef}
         src={buildUrl()}
         className="w-full h-full border-0"
         allowFullScreen
