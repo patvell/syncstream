@@ -9,6 +9,7 @@ import ResumeCard from "@/components/media/ResumeCard";
 import FilterBar from "@/components/layout/FilterBar";
 import type { MediaFilter } from "@/components/layout/FilterBar";
 import { useSpatialNav } from "@/hooks/useSpatialNav";
+import { generateRoomCode } from "@/lib/helpers/room";
 import type { TMDBMediaItem, WatchProgress } from "@/types";
 
 interface HomePageProps {
@@ -74,7 +75,7 @@ export default function HomePageClient({
   );
 
   const createRoom = useCallback(() => {
-    const roomId = crypto.randomUUID();
+    const roomId = generateRoomCode();
     router.push(`/room/${roomId}`);
   }, [router]);
 

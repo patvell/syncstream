@@ -8,6 +8,7 @@ import useWatchProgress from "@/hooks/useWatchProgress";
 import EpisodeSelector from "@/components/media/EpisodeSelector";
 import type { TMDBMediaItem, FrameXTVTimeUpdate } from "@/types";
 import { getImageUrl, getMediaTitle, getMediaYear } from "@/lib/tmdb";
+import { generateRoomCode } from "@/lib/helpers/room";
 
 interface WatchPageClientProps {
   media: TMDBMediaItem | null;
@@ -60,11 +61,11 @@ export default function WatchPageClient({ media }: WatchPageClientProps) {
   }, [isPlaying, startSync, stopSync]);
 
   const createRoom = useCallback(() => {
-    const roomId = crypto.randomUUID();
-    router.push(
-      `/room/${roomId}?tmdbId=${tmdbId}&type=${mediaType}&season=${season}&episode=${episode}`
-    );
-  }, [router, tmdbId, mediaType, season, episode]);
+    const roomId = generateRoomCode();
+    // Keep the link minimal: just the room code. Content + playback state is
+    // synced via realtime lobby/action broadcasts once peers join.
+    router.push(`/room/${roomId}`);
+  }, [router]);
 
   const joinRoom = useCallback(() => {
     if (roomInput.trim()) {

@@ -17,14 +17,39 @@ function getSenderId(): string {
   return id;
 }
 
+async function relay(roomId: string, event: string, payload: unknown) {
+  try {
+    const res = await fetch(`/api/room/${encodeURIComponent(roomId)}/broadcast`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ event, payload }),
+    });
+    if (!res.ok) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 interface UseWatchPartySyncOptions {
   roomId: string;
   playerRef: React.RefObject<PlayerController>;
+  /** Called when this device should adopt the authoritative room state
+   *  (e.g. a joiner snapping to the creator's content + timestamp). */
+  onApplyState?: (state: {
+    tmdbId?: number;
+    mediaType?: MediaType;
+    season?: number;
+    episode?: number;
+    time?: number;
+    playing?: boolean;
+  }) => void;
 }
 
 export default function useWatchPartySync({
   roomId,
   playerRef,
+  onApplyState,
 }: UseWatchPartySyncOptions) {
   // senderId is stable for the component lifetime; store it in a ref for
   // callbacks and expose a derived state value (lazy init runs once).
@@ -34,6 +59,20 @@ export default function useWatchPartySync({
   const [lobbyContent, setLobbyContent] =
     useState<LobbyUpdatePayload | null>(null);
   const lastReceiveTime = useRef(0);
+  // Kept in sync so a peer can answer a request_sync with authoritative state
+  const latestStateRef = useRef<{
+    tmdbId?: number;
+    mediaType?: MediaType;
+    season?: number;
+    episode?: number;
+    time?: number;
+    playing?: boolean;
+  }>({});
+  // Keep onApplyState stable without re-subscribing
+  const onApplyStateRef = useRef(onApplyState);
+  useEffect(() => {
+    onApplyStateRef.current = onApplyState;
+  }, [onApplyState]);
 
   // Send sync action to channel (REST broadcast -- no subscribe needed)
   const broadcastSync = useCallback(
@@ -45,7 +84,6 @@ export default function useWatchPartySync({
       season?: number,
       episode?: number
     ) => {
-      const channel = supabase.channel(`room_${roomId}`);
       const payload: SyncActionPayload = {
         type: "SYNC_ACTION",
         action,
@@ -57,18 +95,9 @@ export default function useWatchPartySync({
         episode,
         timestamp: Date.now(),
       };
-      try {
-        await channel.httpSend("sync", payload);
-      } catch {
-        // best-effort -- fall back to websocket send if REST fails
-        channel.send({
-          type: "broadcast",
-          event: "sync",
-          payload,
-        });
-      } finally {
-        await supabase.removeChannel(channel);
-      }
+      // Relay through our server API (uses service-role key = guaranteed
+      // broadcast permission), so sharing works regardless of the client key.
+      await relay(roomId, "sync", payload);
     },
     [roomId]
   );
@@ -83,32 +112,58 @@ export default function useWatchPartySync({
       title: string;
       posterPath: string | null;
     }) => {
-      const channel = supabase.channel(`room_${roomId}`);
       const payload: LobbyUpdatePayload = {
         type: "LOBBY_UPDATE",
         ...data,
         senderId: senderId.current,
         timestamp: Date.now(),
       };
-      try {
-        await channel.httpSend("lobby", payload);
-      } catch {
-        channel.send({
-          type: "broadcast",
-          event: "lobby",
-          payload,
-        });
-      } finally {
-        await supabase.removeChannel(channel);
-      }
+      await relay(roomId, "lobby", payload);
     },
     [roomId]
   );
 
-  // Join sync
-  const joinSync = useCallback(() => {
-    setIsSynced(true);
-  }, []);
+  // Join sync -- becomes synced AND asks the room for the authoritative state
+  // so the local player snaps to match the creator's position/content.
+  const joinSync = useCallback(
+    (myState?: {
+      tmdbId?: number;
+      mediaType?: MediaType;
+      season?: number;
+      episode?: number;
+      time?: number;
+      playing?: boolean;
+    }) => {
+      setIsSynced(true);
+      // Broadcast a request for the current room state (others will answer
+      // with SYNC_STATE).
+      relay(roomId, "request_sync", {
+        senderId: senderId.current,
+        state: myState ?? null,
+        timestamp: Date.now(),
+      });
+    },
+    [roomId]
+  );
+
+  // Publish the authoritative room state (used to answer a request_sync).
+  const publishState = useCallback(
+    async (state: {
+      tmdbId?: number;
+      mediaType?: MediaType;
+      season?: number;
+      episode?: number;
+      time?: number;
+      playing?: boolean;
+    }) => {
+      await relay(roomId, "sync_state", {
+        senderId: senderId.current,
+        state,
+        timestamp: Date.now(),
+      });
+    },
+    [roomId]
+  );
 
   // Subscribe to room channel
   useEffect(() => {
@@ -151,6 +206,41 @@ export default function useWatchPartySync({
         if (payload.senderId === senderId.current) return;
         setLobbyContent(payload);
       })
+      .on("broadcast", { event: "request_sync" }, (msg) => {
+        // Another device just joined and wants the authoritative state.
+        const payload = msg.payload as {
+          senderId: string;
+          timestamp: number;
+        };
+        if (!payload || payload.senderId === senderId.current) return;
+        // Answer with our latest known state.
+        const s = latestStateRef.current;
+        if (s.tmdbId) {
+          relay(roomId, "sync_state", {
+            senderId: senderId.current,
+            state: s,
+            timestamp: Date.now(),
+          });
+        }
+      })
+      .on("broadcast", { event: "sync_state" }, (msg) => {
+        const payload = msg.payload as {
+          senderId: string;
+          state: {
+            tmdbId?: number;
+            mediaType?: MediaType;
+            season?: number;
+            episode?: number;
+            time?: number;
+            playing?: boolean;
+          };
+          timestamp: number;
+        };
+        if (!payload || payload.senderId === senderId.current) return;
+        // Adopt the authoritative state on this device.
+        latestStateRef.current = payload.state;
+        onApplyStateRef.current?.(payload.state);
+      })
       .subscribe();
 
     return () => {
@@ -158,11 +248,28 @@ export default function useWatchPartySync({
     };
   }, [roomId, playerRef]);
 
+  // Update this device's authoritative snapshot (called on timeupdate).
+  const setLocalState = useCallback(
+    (state: {
+      tmdbId?: number;
+      mediaType?: MediaType;
+      season?: number;
+      episode?: number;
+      time?: number;
+      playing?: boolean;
+    }) => {
+      latestStateRef.current = { ...latestStateRef.current, ...state };
+    },
+    []
+  );
+
   return {
     isSynced,
     joinSync,
     broadcastSync,
     broadcastLobby,
+    publishState,
+    setLocalState,
     lobbyContent,
     senderId: senderIdValue,
   };

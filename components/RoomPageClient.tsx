@@ -59,8 +59,36 @@ export default function RoomPageClient() {
   const [duration, setDuration] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
 
-  const { isSynced, joinSync, broadcastSync, broadcastLobby, lobbyContent } =
-    useWatchPartySync({ roomId, playerRef });
+  const {
+    isSynced,
+    joinSync,
+    broadcastSync,
+    broadcastLobby,
+    lobbyContent,
+    setLocalState,
+  } = useWatchPartySync({
+    roomId,
+    playerRef,
+    onApplyState: (state) => {
+      // Adopt the authoritative room state on THIS device (joiner snapping to
+      // the creator's content + position).
+      setSelectedTmdbId(
+        (prev) => state.tmdbId ?? prev
+      );
+      if (state.mediaType) setSelectedMediaType(state.mediaType);
+      if (state.season) setSelectedSeason(state.season);
+      if (state.episode) setSelectedEpisode(state.episode);
+      // Seek the local player to the authoritative timestamp and match play state
+      if (state.time !== undefined && playerRef.current) {
+        playerRef.current.seek(state.time);
+      }
+      if (state.playing) {
+        playerRef.current?.play();
+      } else {
+        playerRef.current?.pause();
+      }
+    },
+  });
 
   const { updateProgress, startSync, stopSync } = useWatchProgress({
     tmdbId: selectedTmdbId ?? undefined,
@@ -101,6 +129,15 @@ export default function RoomPageClient() {
       setDuration(data.duration);
       setIsPlaying(!data.paused);
       updateProgress(data.currentTime, data.duration);
+      // Keep our authoritative snapshot fresh so a joiner can be synced to us.
+      setLocalState({
+        tmdbId: selectedTmdbId ?? undefined,
+        mediaType: selectedMediaType,
+        season: selectedSeason,
+        episode: selectedEpisode,
+        time: data.currentTime,
+        playing: !data.paused,
+      });
 
       // Broadcast sync for play/pause (only when synced)
       if (isSynced) {
@@ -109,7 +146,7 @@ export default function RoomPageClient() {
         }
       }
     },
-    [updateProgress, isSynced, isPlaying, broadcastSync, selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode]
+    [updateProgress, isSynced, isPlaying, broadcastSync, selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode, setLocalState]
   );
 
   // Sync progress
@@ -171,11 +208,19 @@ export default function RoomPageClient() {
     [broadcastLobby]
   );
 
-  // Handle join sync
+  // Handle join sync -- request the room's authoritative state on join so the
+  // player snaps to what's already playing (fixes "nothing plays" on join).
   const handleJoinSync = useCallback(() => {
     setHasJoined(true);
-    joinSync();
-  }, [joinSync]);
+    joinSync({
+      tmdbId: selectedTmdbId ?? undefined,
+      mediaType: selectedMediaType,
+      season: selectedSeason,
+      episode: selectedEpisode,
+      time: currentTime,
+      playing: isPlaying,
+    });
+  }, [joinSync, selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode, currentTime, isPlaying]);
 
   // Handle player controls broadcast (when synced)
   const handlePlay = useCallback(() => {
