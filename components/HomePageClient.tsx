@@ -74,10 +74,19 @@ export default function HomePageClient({
     [router]
   );
 
-  const createRoom = useCallback(() => {
-    const roomId = generateRoomCode();
-    router.push(`/room/${roomId}`);
-  }, [router]);
+  const createRoom = useCallback(
+    (item?: TMDBMediaItem) => {
+      const roomId = generateRoomCode();
+      const mediaType = item
+        ? item.media_type || (item.title ? "movie" : "tv")
+        : "movie";
+      const params = item
+        ? `?tmdbId=${item.id}&type=${mediaType}&season=1&episode=1`
+        : "";
+      router.push(`/room/${roomId}${params}`);
+    },
+    [router]
+  );
 
   return (
     <div className="min-h-screen bg-zinc-950">
@@ -198,7 +207,7 @@ export default function HomePageClient({
             across any device. Smart TV, mobile, tablet — all in sync.
           </p>
           <button
-            onClick={createRoom}
+            onClick={() => createRoom()}
             className="inline-flex items-center gap-2 px-5 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold rounded-xl transition-colors focusable"
             tabIndex={0}
           >

@@ -11,7 +11,7 @@ const PAUSE_RESUME_DELAY = 3000; // ms after interaction
 
 interface HeroCarouselProps {
   items: TMDBMediaItem[];
-  onCreateRoom: () => void;
+  onCreateRoom: (item: TMDBMediaItem) => void;
 }
 
 export default function HeroCarousel({ items, onCreateRoom }: HeroCarouselProps) {
@@ -164,7 +164,7 @@ export default function HeroCarousel({ items, onCreateRoom }: HeroCarouselProps)
             Watch Now
           </button>
           <button
-            onClick={onCreateRoom}
+            onClick={() => onCreateRoom(heroItem)}
             className="flex items-center gap-2 px-4 py-2 sm:px-5 sm:py-2.5 bg-zinc-800/80 hover:bg-zinc-700/80 text-zinc-200 font-semibold rounded-xl backdrop-blur-sm transition-colors focusable"
             tabIndex={0}
           >

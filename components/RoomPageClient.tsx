@@ -11,6 +11,7 @@ import {
   Check,
   Film,
 } from "lucide-react";
+import { supabase } from "@/lib/supabaseClient";
 import FrameXTVPlayer from "@/components/player/FrameXTVPlayer";
 import type { PlayerController } from "@/components/player/FrameXTVPlayer";
 import useWatchPartySync from "@/hooks/useWatchPartySync";
@@ -47,6 +48,13 @@ export default function RoomPageClient() {
   const [selectedEpisode, setSelectedEpisode] = useState(initialEpisode);
   const [selectedTitle, setSelectedTitle] = useState("");
   const [selectedPoster, setSelectedPoster] = useState<string | null>(null);
+  // Mirror of selectedTmdbId for use inside callbacks without stale closures.
+  const selectedTmdbIdRef = useRef<number | null>(
+    initialTmdbId ? Number(initialTmdbId) : null
+  );
+  useEffect(() => {
+    selectedTmdbIdRef.current = selectedTmdbId;
+  }, [selectedTmdbId]);
 
   // Search
   const [searchQuery, setSearchQuery] = useState("");
@@ -55,6 +63,11 @@ export default function RoomPageClient() {
 
   // Player
   const playerRef = useRef<PlayerController>(null!);
+  const lastPlayBcastRef = useRef(false);
+  // Position to start a freshly-mounted player at (set by sync_state for late
+  // joiners; read once when the player mounts via its startTime prop). State
+  // (not a ref) because it feeds render; only meaningful before mount.
+  const [pendingSeek, setPendingSeek] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -66,21 +79,24 @@ export default function RoomPageClient() {
     broadcastLobby,
     lobbyContent,
     setLocalState,
+    peerCount,
   } = useWatchPartySync({
     roomId,
     playerRef,
+    // Adopt the room's authoritative state. Content is applied ONLY when this
+    // device has no content yet (before its player mounts) -- changing content
+    // on a mounted player would destroy the iframe. Position always applies.
     onApplyState: (state) => {
-      // Adopt the authoritative room state on THIS device (joiner snapping to
-      // the creator's content + position).
-      setSelectedTmdbId(
-        (prev) => state.tmdbId ?? prev
-      );
-      if (state.mediaType) setSelectedMediaType(state.mediaType);
-      if (state.season) setSelectedSeason(state.season);
-      if (state.episode) setSelectedEpisode(state.episode);
-      // Seek the local player to the authoritative timestamp and match play state
-      if (state.time !== undefined && playerRef.current) {
-        playerRef.current.seek(state.time);
+      if (selectedTmdbIdRef.current === null && state.tmdbId) {
+        // Late joiner: adopt content from the room, no player mounted yet.
+        setSelectedTmdbId(state.tmdbId);
+        if (state.mediaType) setSelectedMediaType(state.mediaType);
+        if (state.season) setSelectedSeason(state.season);
+        if (state.episode) setSelectedEpisode(state.episode);
+      }
+      if (state.time !== undefined) {
+        setPendingSeek(state.time);
+        playerRef.current?.seek(state.time);
       }
       if (state.playing) {
         playerRef.current?.play();
@@ -129,26 +145,31 @@ export default function RoomPageClient() {
     (data: FrameXTVTimeUpdate) => {
       setCurrentTime(data.currentTime);
       setDuration(data.duration);
-      setIsPlaying(!data.paused);
+      const playing = !data.paused;
+      setIsPlaying(playing);
       updateProgress(data.currentTime, data.duration);
       // Keep our authoritative snapshot fresh so a joiner can be synced to us.
       setLocalState({
         tmdbId: selectedTmdbId ?? undefined,
-        mediaType: selectedMediaType,
-        season: selectedSeason,
-        episode: selectedEpisode,
         time: data.currentTime,
-        playing: !data.paused,
+        playing,
       });
 
-      // Broadcast sync for play/pause (only when synced)
-      if (isSynced) {
-        if (data.paused && isPlaying) {
-          broadcastSync("pause", undefined, selectedTmdbId ?? 0, selectedMediaType, selectedSeason, selectedEpisode);
-        }
+      // Broadcast play/pause only when the state actually TRANSITIONS (avoids
+      // spamming the channel every ~250ms while playing normally).
+      if (isSynced && playing !== lastPlayBcastRef.current) {
+        lastPlayBcastRef.current = playing;
+        broadcastSync(
+          playing ? "play" : "pause",
+          data.currentTime,
+          selectedTmdbId ?? 0,
+          selectedMediaType,
+          selectedSeason,
+          selectedEpisode
+        );
       }
     },
-    [updateProgress, isSynced, isPlaying, broadcastSync, selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode, setLocalState]
+    [updateProgress, isSynced, broadcastSync, selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode, setLocalState]
   );
 
   // Sync progress
@@ -159,6 +180,62 @@ export default function RoomPageClient() {
       stopSync();
     }
   }, [isSynced, isPlaying, startSync, stopSync]);
+
+  // Persist the room in active_rooms (so we can see/recover rooms later).
+  /* eslint-disable react-hooks/set-state-in-effect */
+  useEffect(() => {
+    if (!roomId || !selectedTmdbId) return;
+    const run = async () => {
+      try {
+        await supabase.from("active_rooms").upsert(
+          {
+            room_id: roomId,
+            tmdb_id: selectedTmdbId,
+            media_type: selectedMediaType,
+            season: selectedSeason,
+            episode: selectedEpisode,
+            is_active: true,
+            created_at: new Date().toISOString(),
+          },
+          { onConflict: "room_id" }
+        );
+      } catch {
+        // best-effort
+      }
+    };
+    run();
+    return () => {
+      const deactivate = async () => {
+        try {
+          await supabase
+            .from("active_rooms")
+            .update({ is_active: false })
+            .eq("room_id", roomId);
+        } catch {
+          // best-effort
+        }
+      };
+      deactivate();
+    };
+  }, [roomId, selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode]);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
+  // Publish our initial content into the authoritative snapshot so late joiners
+  // (who arrive with a clean link) can be synced to it. Runs once on mount.
+  /* eslint-disable react-hooks/exhaustive-deps */
+  useEffect(() => {
+    if (selectedTmdbId) {
+      setLocalState({
+        tmdbId: selectedTmdbId,
+        mediaType: selectedMediaType,
+        season: selectedSeason,
+        episode: selectedEpisode,
+        time: pendingSeek,
+        playing: false,
+      });
+    }
+  }, []);
+  /* eslint-enable react-hooks/exhaustive-deps */
 
   // Search
   const handleSearch = useCallback(async () => {
@@ -204,10 +281,21 @@ export default function RoomPageClient() {
         posterPath: item.poster_path,
       });
 
+      // Also refresh our authoritative snapshot so a late joiner can be synced
+      // to this content even before playback starts.
+      setLocalState({
+        tmdbId: item.id,
+        mediaType: mType,
+        season: 1,
+        episode: 1,
+        time: 0,
+        playing: false,
+      });
+
       setSearchResults([]);
       setSearchQuery("");
     },
-    [broadcastLobby]
+    [broadcastLobby, setLocalState]
   );
 
   // Handle join sync -- request the room's authoritative state on join so the
@@ -275,6 +363,11 @@ export default function RoomPageClient() {
                 {isSynced && (
                   <span className="text-[10px] px-1.5 py-0.5 bg-emerald-500/20 text-emerald-400 rounded-full font-medium">
                     LIVE
+                  </span>
+                )}
+                {peerCount > 0 && (
+                  <span className="text-[10px] px-1.5 py-0.5 bg-zinc-800 text-zinc-400 rounded-full font-medium">
+                    {peerCount + 1} in room
                   </span>
                 )}
               </div>
@@ -407,6 +500,12 @@ export default function RoomPageClient() {
                   ? `"${selectedTitle}" is queued. Tap below to start synced playback.`
                   : "Tap below to start synced playback."}
               </p>
+              {peerCount > 0 && (
+                <p className="text-sm text-emerald-400 mb-4">
+                  {peerCount + 1} device{peerCount + 1 === 1 ? "" : "s"} in this
+                  room — you&apos;ll start together.
+                </p>
+              )}
               <button
                 onClick={handleJoinSync}
                 className="px-10 py-4 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 text-lg font-bold rounded-2xl transition-all hover:scale-105 active:scale-95 focusable shadow-lg shadow-emerald-500/25"
@@ -430,6 +529,7 @@ export default function RoomPageClient() {
               episode={selectedMediaType === "tv" ? selectedEpisode : undefined}
               autoplay={true}
               muted={false}
+              startTime={pendingSeek}
               onTimeUpdate={handleTimeUpdate}
               controllerRef={(controller) => {
                 if (controller) {

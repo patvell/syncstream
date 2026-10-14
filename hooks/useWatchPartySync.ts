@@ -34,8 +34,10 @@ async function relay(roomId: string, event: string, payload: unknown) {
 interface UseWatchPartySyncOptions {
   roomId: string;
   playerRef: React.RefObject<PlayerController>;
-  /** Called when this device should adopt the authoritative room state
-   *  (e.g. a joiner snapping to the creator's content + timestamp). */
+  /** Called when this device should adopt the authoritative ROOM STATE.
+   *  Content fields are only ever applied by the caller when it has NO content
+   *  yet (i.e. before its player has mounted), so changing them can't destroy a
+   *  running player. Position (time/playing) applies to the live player. */
   onApplyState?: (state: {
     tmdbId?: number;
     mediaType?: MediaType;
@@ -59,7 +61,8 @@ export default function useWatchPartySync({
   const [lobbyContent, setLobbyContent] =
     useState<LobbyUpdatePayload | null>(null);
   const lastReceiveTime = useRef(0);
-  // Kept in sync so a peer can answer a request_sync with authoritative state
+  // Our authoritative snapshot: full room state (content + position) so a late
+  // joiner can be brought up to speed even though broadcasts aren't replayed.
   const latestStateRef = useRef<{
     tmdbId?: number;
     mediaType?: MediaType;
@@ -68,6 +71,15 @@ export default function useWatchPartySync({
     time?: number;
     playing?: boolean;
   }>({});
+  // Track peers who have sent us a broadcast this session (for the UI counter).
+  const peerIds = useRef<Set<string>>(new Set());
+  const [peerCount, setPeerCount] = useState(0);
+
+  const trackPeer = useCallback((id: string) => {
+    if (!id || peerIds.current.has(id)) return;
+    peerIds.current.add(id);
+    setPeerCount(peerIds.current.size);
+  }, []);
   // Keep onApplyState stable without re-subscribing
   const onApplyStateRef = useRef(onApplyState);
   useEffect(() => {
@@ -146,25 +158,6 @@ export default function useWatchPartySync({
     [roomId]
   );
 
-  // Publish the authoritative room state (used to answer a request_sync).
-  const publishState = useCallback(
-    async (state: {
-      tmdbId?: number;
-      mediaType?: MediaType;
-      season?: number;
-      episode?: number;
-      time?: number;
-      playing?: boolean;
-    }) => {
-      await relay(roomId, "sync_state", {
-        senderId: senderId.current,
-        state,
-        timestamp: Date.now(),
-      });
-    },
-    [roomId]
-  );
-
   // Subscribe to room channel
   useEffect(() => {
     if (!roomId) return;
@@ -177,6 +170,8 @@ export default function useWatchPartySync({
 
         // Filter own messages
         if (payload.senderId === senderId.current) return;
+
+        trackPeer(payload.senderId);
 
         // Debounce
         const now = Date.now();
@@ -204,21 +199,31 @@ export default function useWatchPartySync({
       .on("broadcast", { event: "lobby" }, (msg) => {
         const payload = msg.payload as LobbyUpdatePayload;
         if (payload.senderId === senderId.current) return;
+        trackPeer(payload.senderId);
         setLobbyContent(payload);
       })
       .on("broadcast", { event: "request_sync" }, (msg) => {
-        // Another device just joined and wants the authoritative state.
+        // Another device just joined and wants the authoritative room state.
         const payload = msg.payload as {
           senderId: string;
           timestamp: number;
         };
         if (!payload || payload.senderId === senderId.current) return;
-        // Answer with our latest known state.
+        trackPeer(payload.senderId);
+        // Answer with full state (content + position) -- a late joiner has no
+        // player mounted yet, so applying content is safe on their side.
         const s = latestStateRef.current;
         if (s.tmdbId) {
           relay(roomId, "sync_state", {
             senderId: senderId.current,
-            state: s,
+            state: {
+              tmdbId: s.tmdbId,
+              mediaType: s.mediaType,
+              season: s.season,
+              episode: s.episode,
+              time: s.time ?? 0,
+              playing: s.playing ?? false,
+            },
             timestamp: Date.now(),
           });
         }
@@ -237,18 +242,31 @@ export default function useWatchPartySync({
           timestamp: number;
         };
         if (!payload || payload.senderId === senderId.current) return;
-        // Adopt the authoritative state on this device.
+        trackPeer(payload.senderId);
+        // Adopt the authoritative room state on this device. The caller decides
+        // whether it can apply content (no player mounted yet) vs only position.
         latestStateRef.current = payload.state;
         onApplyStateRef.current?.(payload.state);
       })
-      .subscribe();
+      .subscribe((status) => {
+        // Once our subscription is live, ask the room for the current state so
+        // late joiners (who missed the ephemeral lobby broadcast) still learn
+        // what's playing. If we're first, nobody answers -- harmless.
+        if (status === "SUBSCRIBED") {
+          relay(roomId, "request_sync", {
+            senderId: senderId.current,
+            state: null,
+            timestamp: Date.now(),
+          });
+        }
+      });
 
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [roomId, playerRef]);
+  }, [roomId, playerRef, trackPeer]);
 
-  // Update this device's authoritative snapshot (called on timeupdate).
+  // Update this device's authoritative snapshot (called on timeupdate + content select).
   const setLocalState = useCallback(
     (state: {
       tmdbId?: number;
@@ -268,9 +286,9 @@ export default function useWatchPartySync({
     joinSync,
     broadcastSync,
     broadcastLobby,
-    publishState,
     setLocalState,
     lobbyContent,
+    peerCount,
     senderId: senderIdValue,
   };
 }
