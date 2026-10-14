@@ -98,10 +98,15 @@ export default function RoomPageClient() {
         setPendingSeek(state.time);
         playerRef.current?.seek(state.time);
       }
-      if (state.playing) {
-        playerRef.current?.play();
-      } else {
-        playerRef.current?.pause();
+      if (state.playing !== undefined) {
+        // Sync our local transition-tracking ref so we don't ECHO the remote
+        // play/pause back into the channel (loop prevention).
+        lastPlayBcastRef.current = state.playing;
+        if (state.playing) {
+          playerRef.current?.play();
+        } else {
+          playerRef.current?.pause();
+        }
       }
     },
   });
@@ -395,23 +400,29 @@ export default function RoomPageClient() {
           {/* Current selection display */}
           {selectedTmdbId ? (
             <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 text-center">
-              <div className="flex items-center justify-center gap-2 mb-4">
-                <Film className="w-5 h-5 text-emerald-500" />
-                <h2 className="text-lg font-semibold text-zinc-200">
-                  {selectedTitle || "Selected Content"}
+              <div className="flex items-center justify-center gap-2 mb-2">
+                <Film className="w-4 h-4 text-emerald-500" />
+                <h2 className="text-base font-semibold text-zinc-200">
+                  Queued for everyone
                 </h2>
               </div>
               {selectedPoster && (
                 <img
-                  src={getImageUrl(selectedPoster, "w342")}
+                  src={getImageUrl(selectedPoster, "w500")}
                   alt={selectedTitle}
-                  className="w-40 mx-auto rounded-xl mb-4 shadow-lg"
+                  className="w-48 sm:w-56 mx-auto rounded-xl mb-3 shadow-lg"
                 />
               )}
-              <p className="text-sm text-zinc-400 mb-4">
+              <h3 className="text-xl font-bold text-zinc-100 mb-1">
+                {selectedTitle || "Selected Content"}
+              </h3>
+              <p className="text-sm text-zinc-400 mb-2">
                 {selectedMediaType === "movie" ? "Movie" : "TV Show"}{" "}
                 {selectedSeason > 1 && `S${selectedSeason}`}
                 {selectedEpisode > 1 && ` E${selectedEpisode}`}
+              </p>
+              <p className="text-xs text-zinc-500 mb-1">
+                Everyone in this room will watch together.
               </p>
             </div>
           ) : (
@@ -427,63 +438,68 @@ export default function RoomPageClient() {
             </div>
           )}
 
-          {/* Search bar */}
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleSearch();
-              }}
-              placeholder="Search movies & TV shows..."
-              className="flex-1 h-12 bg-zinc-800 border border-zinc-700 rounded-xl px-4 py-3 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/30"
-            />
-            <button
-              onClick={handleSearch}
-              disabled={isSearching}
-              className="h-12 px-5 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold rounded-xl transition-colors focusable disabled:opacity-50"
-              tabIndex={0}
-            >
-              <Search className="w-5 h-5" />
-            </button>
-          </div>
-
-          {/* Search results */}
-          {isSearching ? (
-            <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-3">
-              {Array.from({ length: 10 }).map((_, i) => (
-                <div
-                  key={i}
-                  className="aspect-[2/3] rounded-xl bg-zinc-800 animate-pulse"
+          {/* Search bar + results -- ONLY shown when the room has no content
+              selected yet. Once content is queued (from URL or sync_state),
+              browsing is hidden: the flow is confirm + join, not browse. */}
+          {!selectedTmdbId && (
+            <>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handleSearch();
+                  }}
+                  placeholder="Search movies & TV shows..."
+                  className="flex-1 h-12 bg-zinc-800 border border-zinc-700 rounded-xl px-4 py-3 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/30"
                 />
-              ))}
-            </div>
-          ) : searchResults.length > 0 ? (
-            <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-3">
-              {searchResults.slice(0, 15).map((item) => (
-                <div
-                  key={item.id}
-                  onClick={() => selectContent(item)}
-                  className="focusable group cursor-pointer"
+                <button
+                  onClick={handleSearch}
+                  disabled={isSearching}
+                  className="h-12 px-5 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold rounded-xl transition-colors focusable disabled:opacity-50"
                   tabIndex={0}
-                  role="button"
                 >
-                  <div className="relative aspect-[2/3] rounded-xl overflow-hidden bg-zinc-800">
-                    <img
-                      src={getImageUrl(item.poster_path, "w342")}
-                      alt={getMediaTitle(item)}
-                      className="w-full h-full object-cover group-hover:opacity-80 transition-opacity"
-                      loading="lazy"
+                  <Search className="w-5 h-5" />
+                </button>
+              </div>
+
+              {isSearching ? (
+                <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-3">
+                  {Array.from({ length: 10 }).map((_, i) => (
+                    <div
+                      key={i}
+                      className="aspect-[2/3] rounded-xl bg-zinc-800 animate-pulse"
                     />
-                  </div>
-                  <p className="mt-1.5 text-xs text-zinc-400 truncate">
-                    {getMediaTitle(item)}
-                  </p>
+                  ))}
                 </div>
-              ))}
-            </div>
-          ) : null}
+              ) : searchResults.length > 0 ? (
+                <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-3">
+                  {searchResults.slice(0, 15).map((item) => (
+                    <div
+                      key={item.id}
+                      onClick={() => selectContent(item)}
+                      className="focusable group cursor-pointer"
+                      tabIndex={0}
+                      role="button"
+                    >
+                      <div className="relative aspect-[2/3] rounded-xl overflow-hidden bg-zinc-800">
+                        <img
+                          src={getImageUrl(item.poster_path, "w342")}
+                          alt={getMediaTitle(item)}
+                          className="w-full h-full object-cover group-hover:opacity-80 transition-opacity"
+                          loading="lazy"
+                        />
+                      </div>
+                      <p className="mt-1.5 text-xs text-zinc-400 truncate">
+                        {getMediaTitle(item)}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </>
+          )}
 
           {/* Join Sync prompt -- only after a title is selected.
               Inline (not full-screen) so browsing stays usable. */}

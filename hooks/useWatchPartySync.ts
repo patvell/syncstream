@@ -61,6 +61,11 @@ export default function useWatchPartySync({
   const [lobbyContent, setLobbyContent] =
     useState<LobbyUpdatePayload | null>(null);
   const lastReceiveTime = useRef(0);
+  // The subscribed WebSocket channel -- reused for sending (fast delivery to
+  // the same room subscribers) instead of a disposable REST relay per send.
+  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  // Flag so we only relay as a fallback before the WS channel is joined.
+  const channelJoined = useRef(false);
   // Our authoritative snapshot: full room state (content + position) so a late
   // joiner can be brought up to speed even though broadcasts aren't replayed.
   const latestStateRef = useRef<{
@@ -86,7 +91,9 @@ export default function useWatchPartySync({
     onApplyStateRef.current = onApplyState;
   }, [onApplyState]);
 
-  // Send sync action to channel (REST broadcast -- no subscribe needed)
+  // Send sync action to channel. Primary: WebSocket on the subscribed channel
+  // (fast, same-topic). Fallback: REST relay via server API (service-role key)
+  // in case the WS channel isn't joined yet.
   const broadcastSync = useCallback(
     async (
       action: "play" | "pause" | "seek",
@@ -107,14 +114,17 @@ export default function useWatchPartySync({
         episode,
         timestamp: Date.now(),
       };
-      // Relay through our server API (uses service-role key = guaranteed
-      // broadcast permission), so sharing works regardless of the client key.
+      const ch = channelRef.current;
+      if (ch && channelJoined.current) {
+        await ch.send({ type: "broadcast", event: "sync", payload });
+        return;
+      }
       await relay(roomId, "sync", payload);
     },
     [roomId]
   );
 
-  // Send lobby update to channel (REST broadcast)
+  // Send lobby update to channel. Same strategy as broadcastSync.
   const broadcastLobby = useCallback(
     async (data: {
       tmdbId: number;
@@ -130,6 +140,11 @@ export default function useWatchPartySync({
         senderId: senderId.current,
         timestamp: Date.now(),
       };
+      const ch = channelRef.current;
+      if (ch && channelJoined.current) {
+        await ch.send({ type: "broadcast", event: "lobby", payload });
+        return;
+      }
       await relay(roomId, "lobby", payload);
     },
     [roomId]
@@ -163,6 +178,7 @@ export default function useWatchPartySync({
     if (!roomId) return;
 
     const channel = supabase.channel(`room_${roomId}`);
+    channelRef.current = channel;
 
     channel
       .on("broadcast", { event: "sync" }, (msg) => {
@@ -249,10 +265,11 @@ export default function useWatchPartySync({
         onApplyStateRef.current?.(payload.state);
       })
       .subscribe((status) => {
-        // Once our subscription is live, ask the room for the current state so
-        // late joiners (who missed the ephemeral lobby broadcast) still learn
-        // what's playing. If we're first, nobody answers -- harmless.
         if (status === "SUBSCRIBED") {
+          channelJoined.current = true;
+          // Once our subscription is live, ask the room for the current state so
+          // late joiners (who missed the ephemeral lobby broadcast) still learn
+          // what's playing. If we're first, nobody answers -- harmless.
           relay(roomId, "request_sync", {
             senderId: senderId.current,
             state: null,
@@ -263,6 +280,8 @@ export default function useWatchPartySync({
 
     return () => {
       supabase.removeChannel(channel);
+      channelRef.current = null;
+      channelJoined.current = false;
     };
   }, [roomId, playerRef, trackPeer]);
 
