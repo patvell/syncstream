@@ -62,12 +62,13 @@ export default function WatchPageClient({ media }: WatchPageClientProps) {
 
   const createRoom = useCallback(() => {
     const roomId = generateRoomCode();
-    // Creator's own URL carries the initial content; the room link shared to
-    // friends is clean (peers pick up content + state via realtime sync).
+    // Creator's own URL carries the content + current position + host flag.
+    // host=1 lets the host enter the room directly (paused at `t`) with NO
+    // lobby gate; peers get a clean link (copyRoomLink strips these).
     router.push(
-      `/room/${roomId}?tmdbId=${tmdbId}&type=${mediaType}&season=${season}&episode=${episode}`
+      `/room/${roomId}?tmdbId=${tmdbId}&type=${mediaType}&season=${season}&episode=${episode}&t=${Math.floor(currentTime)}&host=1`
     );
-  }, [router, tmdbId, mediaType, season, episode]);
+  }, [router, tmdbId, mediaType, season, episode, currentTime]);
 
   const joinRoom = useCallback(() => {
     if (roomInput.trim()) {

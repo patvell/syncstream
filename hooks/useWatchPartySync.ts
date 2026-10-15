@@ -34,6 +34,8 @@ async function relay(roomId: string, event: string, payload: unknown) {
 interface UseWatchPartySyncOptions {
   roomId: string;
   playerRef: React.RefObject<PlayerController>;
+  /** Returns this device's current playhead (used for drift correction). */
+  getLocalTime?: () => number;
   /** Called when this device should adopt the authoritative ROOM STATE.
    *  Content fields are only ever applied by the caller when it has NO content
    *  yet (i.e. before its player has mounted), so changing them can't destroy a
@@ -43,6 +45,8 @@ interface UseWatchPartySyncOptions {
     mediaType?: MediaType;
     season?: number;
     episode?: number;
+    title?: string;
+    posterPath?: string | null;
     time?: number;
     playing?: boolean;
   }) => void;
@@ -52,6 +56,7 @@ export default function useWatchPartySync({
   roomId,
   playerRef,
   onApplyState,
+  getLocalTime,
 }: UseWatchPartySyncOptions) {
   // senderId is stable for the component lifetime; store it in a ref for
   // callbacks and expose a derived state value (lazy init runs once).
@@ -73,6 +78,8 @@ export default function useWatchPartySync({
     mediaType?: MediaType;
     season?: number;
     episode?: number;
+    title?: string;
+    posterPath?: string | null;
     time?: number;
     playing?: boolean;
   }>({});
@@ -90,6 +97,11 @@ export default function useWatchPartySync({
   useEffect(() => {
     onApplyStateRef.current = onApplyState;
   }, [onApplyState]);
+  // Keep getLocalTime stable without re-subscribing.
+  const getLocalTimeRef = useRef(getLocalTime);
+  useEffect(() => {
+    getLocalTimeRef.current = getLocalTime;
+  }, [getLocalTime]);
 
   // Send sync action to channel. Primary: WebSocket on the subscribed channel
   // (fast, same-topic). Fallback: REST relay via server API (service-role key)
@@ -189,20 +201,33 @@ export default function useWatchPartySync({
 
         trackPeer(payload.senderId);
 
-        // Debounce
+        // Debounce rapid repeats per action, but ensure the LAST event of a
+        // seek burst is not lost (seek carries its own authoritative target).
         const now = Date.now();
-        if (now - lastReceiveTime.current < DEBOUNCE_MS) return;
+        if (payload.action !== "seek" && now - lastReceiveTime.current < DEBOUNCE_MS) return;
         lastReceiveTime.current = now;
 
         // Execute on player
         const player = playerRef.current;
         if (!player) return;
 
+        // Transit latency compensation: how long the message took to arrive.
+        const transit = Math.min(1.5, Math.max(0, (now - (payload.timestamp || now)) / 1000));
+
         switch (payload.action) {
           case "play":
+            // Seek to the exact target first so both players start on the same
+            // frame, then play.
+            if (payload.time !== undefined) {
+              player.seek(payload.time + transit);
+            }
             player.play();
             break;
           case "pause":
+            // Freeze on the exact same frame.
+            if (payload.time !== undefined) {
+              player.seek(payload.time);
+            }
             player.pause();
             break;
           case "seek":
@@ -237,6 +262,8 @@ export default function useWatchPartySync({
               mediaType: s.mediaType,
               season: s.season,
               episode: s.episode,
+              title: s.title,
+              posterPath: s.posterPath,
               time: s.time ?? 0,
               playing: s.playing ?? false,
             },
@@ -252,6 +279,8 @@ export default function useWatchPartySync({
             mediaType?: MediaType;
             season?: number;
             episode?: number;
+            title?: string;
+            posterPath?: string | null;
             time?: number;
             playing?: boolean;
           };
@@ -263,6 +292,26 @@ export default function useWatchPartySync({
         // whether it can apply content (no player mounted yet) vs only position.
         latestStateRef.current = payload.state;
         onApplyStateRef.current?.(payload.state);
+      })
+      .on("broadcast", { event: "heartbeat" }, (msg) => {
+        // Drift correction while playing.
+        const payload = msg.payload as {
+          senderId: string;
+          time?: number;
+          playing?: boolean;
+          timestamp: number;
+        };
+        if (!payload || payload.senderId === senderId.current) return;
+        if (payload.time === undefined) return;
+        const transit = Math.min(1.5, Math.max(0, (Date.now() - payload.timestamp) / 1000));
+        const target = payload.time + transit;
+        const player = playerRef.current;
+        const localTime = getLocalTimeRef.current?.() ?? 0;
+        // Correct only if we are meaningfully out of sync (>1.5s); otherwise
+        // skip to avoid micro-stutter from network jitter.
+        if (player && Math.abs(localTime - target) > 1.5) {
+          player.seek(target);
+        }
       })
       .subscribe((status) => {
         if (status === "SUBSCRIBED") {
@@ -292,6 +341,8 @@ export default function useWatchPartySync({
       mediaType?: MediaType;
       season?: number;
       episode?: number;
+      title?: string;
+      posterPath?: string | null;
       time?: number;
       playing?: boolean;
     }) => {
@@ -300,11 +351,42 @@ export default function useWatchPartySync({
     []
   );
 
+  // Ask the room for the current authoritative state (used after a player
+  // loads, so a late joiner is snapped to the live timestamp, not a stale one).
+  const requestSync = useCallback(() => {
+    relay(roomId, "request_sync", {
+      senderId: senderId.current,
+      state: null,
+      timestamp: Date.now(),
+    });
+  }, [roomId]);
+
+  // Emit a lightweight heartbeat so peers can auto-correct drift while playing.
+  const broadcastHeartbeat = useCallback(
+    (time: number, playing: boolean) => {
+      const ch = channelRef.current;
+      const payload = {
+        senderId: senderId.current,
+        time,
+        playing,
+        timestamp: Date.now(),
+      };
+      if (ch && channelJoined.current) {
+        ch.send({ type: "broadcast", event: "heartbeat", payload }).catch(() => {});
+      } else {
+        relay(roomId, "heartbeat", payload);
+      }
+    },
+    [roomId]
+  );
+
   return {
     isSynced,
     joinSync,
+    requestSync,
     broadcastSync,
     broadcastLobby,
+    broadcastHeartbeat,
     setLocalState,
     lobbyContent,
     peerCount,

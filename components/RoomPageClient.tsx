@@ -5,6 +5,8 @@ import { useRouter, useParams, useSearchParams } from "next/navigation";
 import {
   Users,
   Play,
+  Pause,
+  RefreshCw,
   Search,
   ArrowLeft,
   Copy,
@@ -23,6 +25,11 @@ import type {
 } from "@/types";
 import { getImageUrl, getMediaTitle } from "@/lib/tmdb";
 
+function fmt(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
 export default function RoomPageClient() {
   const router = useRouter();
   const params = useParams();
@@ -33,9 +40,13 @@ export default function RoomPageClient() {
   const initialType = (searchParams.get("type") as MediaType) || "movie";
   const initialSeason = Number(searchParams.get("season")) || 1;
   const initialEpisode = Number(searchParams.get("episode")) || 1;
+  const initialTime = Number(searchParams.get("t")) || 0;
+  // Host enters the room directly (paused at `t`), no lobby gate.
+  const isHost = searchParams.get("host") === "1";
 
   // Room state
-  const [hasJoined, setHasJoined] = useState(false);
+  // If host, jump straight into the (paused) player view.
+  const [hasJoined, setHasJoined] = useState(isHost);
   const [copied, setCopied] = useState(false);
 
   // Content selection state (lobby or current)
@@ -56,6 +67,9 @@ export default function RoomPageClient() {
     selectedTmdbIdRef.current = selectedTmdbId;
   }, [selectedTmdbId]);
 
+  // Host flag mirror (used in onReady callback; avoids stale closure).
+  const isHostRef = useRef(isHost);
+
   // Search
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<TMDBMediaItem[]>([]);
@@ -63,30 +77,48 @@ export default function RoomPageClient() {
 
   // Player
   const playerRef = useRef<PlayerController>(null!);
-  const lastPlayBcastRef = useRef(false);
-  // Position to start a freshly-mounted player at (set by sync_state for late
-  // joiners; read once when the player mounts via its startTime prop). State
-  // (not a ref) because it feeds render; only meaningful before mount.
-  const [pendingSeek, setPendingSeek] = useState(0);
-  const [currentTime, setCurrentTime] = useState(0);
+  const lastPlayBcastRef = useRef(isHost ? false : false);
+  const lastTimeRef = useRef(0);
+  const suppressEchoUntilRef = useRef(0);
+  // Position to start a freshly-mounted player at. For the host it's the time
+  // they were watching when creating the room; for peers it's the synced time.
+  const [pendingSeek, setPendingSeek] = useState(initialTime);
+  const [currentTime, setCurrentTime] = useState(initialTime);
   const [duration, setDuration] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  // Scrubbing state (visual position while dragging, commit on release).
+  const [scrubTime, setScrubTime] = useState<number | null>(null);
+
+  // Mirrors for use inside realtime callbacks (avoid stale closures).
+  const hasJoinedRef = useRef(hasJoined);
+  useEffect(() => {
+    hasJoinedRef.current = hasJoined;
+  }, [hasJoined]);
+  const currentTimeRef = useRef(currentTime);
+  useEffect(() => {
+    currentTimeRef.current = currentTime;
+  }, [currentTime]);
 
   const {
     isSynced,
     joinSync,
+    requestSync,
     broadcastSync,
     broadcastLobby,
+    broadcastHeartbeat,
     lobbyContent,
     setLocalState,
     peerCount,
   } = useWatchPartySync({
     roomId,
     playerRef,
+    getLocalTime: () => currentTimeRef.current,
     // Adopt the room's authoritative state. Content is applied ONLY when this
     // device has no content yet (before its player mounts) -- changing content
     // on a mounted player would destroy the iframe. Position always applies.
     onApplyState: (state) => {
+      if (state.title) setSelectedTitle(state.title);
+      if (state.posterPath) setSelectedPoster(state.posterPath);
       if (selectedTmdbIdRef.current === null && state.tmdbId) {
         // Late joiner: adopt content from the room, no player mounted yet.
         setSelectedTmdbId(state.tmdbId);
@@ -96,16 +128,22 @@ export default function RoomPageClient() {
       }
       if (state.time !== undefined) {
         setPendingSeek(state.time);
-        playerRef.current?.seek(state.time);
+        // Only seek if a player is already mounted.
+        if (hasJoinedRef.current) {
+          playerRef.current?.seek(state.time);
+        }
+        suppressEchoUntilRef.current = Date.now() + 800;
       }
       if (state.playing !== undefined) {
         // Sync our local transition-tracking ref so we don't ECHO the remote
         // play/pause back into the channel (loop prevention).
         lastPlayBcastRef.current = state.playing;
-        if (state.playing) {
-          playerRef.current?.play();
-        } else {
-          playerRef.current?.pause();
+        if (hasJoinedRef.current) {
+          if (state.playing) {
+            playerRef.current?.play();
+          } else {
+            playerRef.current?.pause();
+          }
         }
       }
     },
@@ -148,25 +186,42 @@ export default function RoomPageClient() {
   // Handle time updates
   const handleTimeUpdate = useCallback(
     (data: FrameXTVTimeUpdate) => {
-      setCurrentTime(data.currentTime);
-      setDuration(data.duration);
-      const playing = !data.paused;
+      const { currentTime: t, duration: d, paused } = data;
+      setCurrentTime(t);
+      currentTimeRef.current = t;
+      setDuration(d);
+      const playing = !paused;
       setIsPlaying(playing);
-      updateProgress(data.currentTime, data.duration);
+      updateProgress(t, d);
       // Keep our authoritative snapshot fresh so a joiner can be synced to us.
       setLocalState({
         tmdbId: selectedTmdbId ?? undefined,
-        time: data.currentTime,
+        mediaType: selectedMediaType,
+        season: selectedSeason,
+        episode: selectedEpisode,
+        title: selectedTitle || undefined,
+        posterPath: selectedPoster,
+        time: t,
         playing,
       });
 
-      // Broadcast play/pause only when the state actually TRANSITIONS (avoids
-      // spamming the channel every ~250ms while playing normally).
+      // Native iframe scrub detection: if the user scrubbed inside FrameXTV's
+      // own controls (a sudden time jump while we're past the echo window),
+      // broadcast the new position so all peers follow.
+      const jumped = Math.abs(t - lastTimeRef.current) > 2.5;
+      if (jumped && Date.now() > suppressEchoUntilRef.current && isSynced) {
+        suppressEchoUntilRef.current = Date.now() + 800;
+        broadcastSync("seek", t, selectedTmdbId ?? 0, selectedMediaType, selectedSeason, selectedEpisode);
+      }
+      lastTimeRef.current = t;
+
+      // Broadcast play/pause only when the state actually TRANSITIONS
+      // (avoids spamming the channel every ~250ms while playing normally).
       if (isSynced && playing !== lastPlayBcastRef.current) {
         lastPlayBcastRef.current = playing;
         broadcastSync(
           playing ? "play" : "pause",
-          data.currentTime,
+          t,
           selectedTmdbId ?? 0,
           selectedMediaType,
           selectedSeason,
@@ -174,7 +229,7 @@ export default function RoomPageClient() {
         );
       }
     },
-    [updateProgress, isSynced, broadcastSync, selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode, setLocalState]
+    [updateProgress, isSynced, broadcastSync, selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode, selectedTitle, selectedPoster, setLocalState]
   );
 
   // Sync progress
@@ -241,6 +296,41 @@ export default function RoomPageClient() {
     }
   }, []);
   /* eslint-enable react-hooks/exhaustive-deps */
+
+  // Auto-fetch TMDB title/poster when we have a selectedTmdbId but no title
+  // yet (host arriving from URL, or a sync_state that only carried the id).
+  /* eslint-disable react-hooks/exhaustive-deps */
+  useEffect(() => {
+    if (selectedTmdbId && !selectedTitle) {
+      const fetchDetails = async () => {
+        try {
+          const res = await fetch(
+            `/api/tmdb/${selectedMediaType}/${selectedTmdbId}`
+          );
+          const data = await res.json();
+          if (data?.title || data?.name) {
+            setSelectedTitle(data.title || data.name);
+          }
+          if (data?.poster_path) {
+            setSelectedPoster(data.poster_path);
+          }
+        } catch {
+          // best-effort
+        }
+      };
+      fetchDetails();
+    }
+  }, [selectedTmdbId, selectedMediaType, selectedTitle]);
+  /* eslint-enable react-hooks/exhaustive-deps */
+
+  // Heartbeat interval while synced + playing, so peers auto-correct drift.
+  useEffect(() => {
+    if (!isSynced || !isPlaying) return;
+    const interval = setInterval(() => {
+      broadcastHeartbeat(currentTimeRef.current, true);
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [isSynced, isPlaying, broadcastHeartbeat]);
 
   // Search
   const handleSearch = useCallback(async () => {
@@ -317,30 +407,53 @@ export default function RoomPageClient() {
     });
   }, [joinSync, selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode, currentTime, isPlaying]);
 
-  // Handle player controls broadcast (when synced)
+  // Coordinated Play: broadcast with a start delay so both devices fire play()
+  // at ~the same physical instant. Locally we also wait ~100ms (approx WS
+  // transit) so we don't get ahead of the peer.
   const handlePlay = useCallback(() => {
-    playerRef.current?.play();
     if (isSynced) {
-      broadcastSync("play", currentTime, selectedTmdbId ?? 0, selectedMediaType, selectedSeason, selectedEpisode);
+      const targetTime = currentTimeRef.current;
+      broadcastSync("play", targetTime, selectedTmdbId ?? 0, selectedMediaType, selectedSeason, selectedEpisode);
+      setTimeout(() => {
+        playerRef.current?.seek(targetTime);
+        playerRef.current?.play();
+      }, 100);
+    } else {
+      playerRef.current?.play();
     }
-  }, [isSynced, currentTime, selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode, broadcastSync]);
+  }, [isSynced, selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode, broadcastSync]);
 
   const handlePause = useCallback(() => {
-    playerRef.current?.pause();
+    const targetTime = currentTimeRef.current;
     if (isSynced) {
-      broadcastSync("pause", currentTime, selectedTmdbId ?? 0, selectedMediaType, selectedSeason, selectedEpisode);
+      broadcastSync("pause", targetTime, selectedTmdbId ?? 0, selectedMediaType, selectedSeason, selectedEpisode);
     }
-  }, [isSynced, currentTime, selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode, broadcastSync]);
+    // Freeze on the exact frame locally too.
+    playerRef.current?.seek(targetTime);
+    playerRef.current?.pause();
+    lastPlayBcastRef.current = false;
+  }, [isSynced, selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode, broadcastSync]);
 
   const handleSeek = useCallback(
     (time: number) => {
       playerRef.current?.seek(time);
+      setCurrentTime(time);
       if (isSynced) {
         broadcastSync("seek", time, selectedTmdbId ?? 0, selectedMediaType, selectedSeason, selectedEpisode);
       }
     },
     [isSynced, selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode, broadcastSync]
   );
+
+  // Force re-sync: tell all peers (and ourselves) to snap to our exact position.
+  const handleResync = useCallback(() => {
+    const t = currentTimeRef.current;
+    playerRef.current?.seek(t);
+    broadcastSync("seek", t, selectedTmdbId ?? 0, selectedMediaType, selectedSeason, selectedEpisode);
+    if (hasJoinedRef.current) {
+      requestSync();
+    }
+  }, [selectedTmdbId, selectedMediaType, selectedSeason, selectedEpisode, broadcastSync, requestSync]);
 
   return (
     <div className="min-h-screen bg-zinc-950">
@@ -422,7 +535,10 @@ export default function RoomPageClient() {
                 {selectedEpisode > 1 && ` E${selectedEpisode}`}
               </p>
               <p className="text-xs text-zinc-500 mb-1">
-                Everyone in this room will watch together.
+                {isPlaying
+                  ? `Playing now • ${fmt(currentTime)}`
+                  : `Paused at ${fmt(currentTime)}`}
+                {" "}— everyone in this room will watch together.
               </p>
             </div>
           ) : (
@@ -527,7 +643,7 @@ export default function RoomPageClient() {
                 className="px-10 py-4 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 text-lg font-bold rounded-2xl transition-all hover:scale-105 active:scale-95 focusable shadow-lg shadow-emerald-500/25"
                 tabIndex={0}
               >
-                Tap to Join Sync
+                Join Watch Party
               </button>
             </div>
           )}
@@ -543,10 +659,17 @@ export default function RoomPageClient() {
               tmdbId={selectedTmdbId}
               season={selectedMediaType === "tv" ? selectedSeason : undefined}
               episode={selectedMediaType === "tv" ? selectedEpisode : undefined}
-              autoplay={true}
+              autoplay={false}
               muted={false}
               startTime={pendingSeek}
               onTimeUpdate={handleTimeUpdate}
+              onReady={() => {
+                // Once the peer's iframe has actually loaded, request a fresh
+                // sync so they snap to the live timestamp (not a stale one).
+                if (!isHostRef.current) {
+                  requestSync();
+                }
+              }}
               controllerRef={(controller) => {
                 if (controller) {
                   playerRef.current = controller;
@@ -556,58 +679,99 @@ export default function RoomPageClient() {
           </div>
 
           {/* Now playing info */}
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             <div>
               <h2 className="text-lg font-bold text-zinc-100">
-                {selectedTitle}
+                {selectedTitle || `Title #${selectedTmdbId}`}
               </h2>
               <p className="text-sm text-zinc-400">
                 {selectedMediaType === "movie" ? "Movie" : "TV"}{" "}
-                {isSynced && "• Synced"}
+                {selectedSeason > 1 && `S${selectedSeason}`}
+                {selectedEpisode > 1 && ` E${selectedEpisode}`}
+                {isSynced && (
+                  <span className="ml-2 text-emerald-400">• Synced</span>
+                )}
+                {peerCount > 0 && (
+                  <span className="ml-2 text-zinc-500">
+                    • {peerCount + 1} in room
+                  </span>
+                )}
               </p>
             </div>
-
-            {/* Manual controls for sync testing */}
-            {isSynced && (
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={handlePlay}
-                  className="px-4 py-2 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 rounded-lg text-sm font-medium transition-colors focusable"
-                  tabIndex={0}
-                >
-                  <Play className="w-4 h-4 fill-emerald-400 inline mr-1" />
-                  Play All
-                </button>
-                <button
-                  onClick={handlePause}
-                  className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-lg text-sm font-medium transition-colors focusable"
-                  tabIndex={0}
-                >
-                  Pause All
-                </button>
-              </div>
-            )}
           </div>
 
-          {/* Progress bar (manual seek) */}
+          {/* Sync Control Bar */}
           {duration > 0 && (
-            <div className="space-y-1">
-              <input
-                type="range"
-                min={0}
-                max={duration}
-                value={currentTime}
-                onChange={(e) => handleSeek(Number(e.target.value))}
-                className="w-full h-1.5 bg-zinc-800 rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-emerald-500 [&::-webkit-slider-thumb]:shadow-lg"
-              />
-              <div className="flex justify-between text-xs text-zinc-500">
-                <span>
-                  {Math.floor(currentTime / 60)}:
-                  {String(Math.floor(currentTime % 60)).padStart(2, "0")}
+            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4 space-y-3">
+              {/* Playback controls */}
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={isPlaying ? handlePause : handlePlay}
+                  className="px-5 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold rounded-xl transition-colors focusable flex items-center gap-2"
+                  tabIndex={0}
+                >
+                  {isPlaying ? (
+                    <Pause className="w-5 h-5 fill-zinc-950" />
+                  ) : (
+                    <Play className="w-5 h-5 fill-zinc-950" />
+                  )}
+                  {isPlaying ? "Pause" : "Play"}
+                </button>
+                <button
+                  onClick={() => handleSeek(Math.max(0, currentTime - 10))}
+                  className="px-4 py-2.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-xl text-sm font-medium transition-colors focusable"
+                  tabIndex={0}
+                >
+                  -10s
+                </button>
+                <button
+                  onClick={() => handleSeek(Math.min(duration, currentTime + 10))}
+                  className="px-4 py-2.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-xl text-sm font-medium transition-colors focusable"
+                  tabIndex={0}
+                >
+                  +10s
+                </button>
+                <button
+                  onClick={handleResync}
+                  className="px-4 py-2.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-xl text-sm font-medium transition-colors focusable flex items-center gap-1.5 ml-auto"
+                  tabIndex={0}
+                >
+                  <RefreshCw className="w-4 h-4" />
+                  Sync All
+                </button>
+              </div>
+
+              {/* Commit-on-release scrubber */}
+              <div className="flex items-center gap-3">
+                <span className="text-xs tabular-nums text-zinc-400 w-10 text-right">
+                  {fmt(scrubTime ?? currentTime)}
                 </span>
-                <span>
-                  {Math.floor(duration / 60)}:
-                  {String(Math.floor(duration % 60)).padStart(2, "0")}
+                <input
+                  type="range"
+                  min={0}
+                  max={duration}
+                  value={scrubTime ?? currentTime}
+                  onChange={(e) => setScrubTime(Number(e.target.value))}
+                  onPointerUp={() => {
+                    if (scrubTime != null) handleSeek(scrubTime);
+                    setScrubTime(null);
+                  }}
+                  onMouseUp={() => {
+                    if (scrubTime != null) handleSeek(scrubTime);
+                    setScrubTime(null);
+                  }}
+                  onTouchEnd={() => {
+                    if (scrubTime != null) handleSeek(scrubTime);
+                    setScrubTime(null);
+                  }}
+                  onKeyUp={() => {
+                    if (scrubTime != null) handleSeek(scrubTime);
+                    setScrubTime(null);
+                  }}
+                  className="flex-1 h-1.5 bg-zinc-800 rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-emerald-500 [&::-webkit-slider-thumb]:shadow-lg"
+                />
+                <span className="text-xs tabular-nums text-zinc-400 w-10">
+                  {fmt(duration)}
                 </span>
               </div>
             </div>
